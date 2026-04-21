@@ -285,7 +285,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     const msg = messages[0];
-    const from = msg.from;
+    console.log("📲 Mensaje recibido de:", from);
     const type = msg.type;
     const S = sess(from);
 
