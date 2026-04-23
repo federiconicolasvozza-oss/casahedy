@@ -19,7 +19,7 @@ const TIENDANUBE_STORE_ID = process.env.TIENDANUBE_STORE_ID;
 
 const API_VERSION = 'v25.0';
 const WHATSAPP_API_URL = `https://graph.facebook.com/${API_VERSION}`;
-const GEMINI_MODEL = 'gemini-2.0-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 const TIENDANUBE_API_URL = TIENDANUBE_STORE_ID ? `https://api.tiendanube.com/v1/${TIENDANUBE_STORE_ID}` : null;
 const TIENDANUBE_HEADERS = {
