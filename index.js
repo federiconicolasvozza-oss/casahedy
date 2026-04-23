@@ -612,7 +612,8 @@ async function handleIncomingMessage(body) {
 
     const { text: aiResponse, leadData } = await generateResponse(from, messageBody);
 
-    // Delay humano: espera 2-4 segundos antes de responder
+    // Mostrar "escribiendo..." y esperar para parecer humano
+    await showTyping(from);
     const delay = 2000 + Math.random() * 2000;
     await new Promise(r => setTimeout(r, delay));
 
