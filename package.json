@@ -2,10 +2,10 @@
   "name": "whatsapp-bot-casahedy",
   "version": "1.0.0",
   "description": "Bot WhatsApp de Casa Hedy - Cuchillería y Ferretería con IA (Gemini Flash 2.0)",
-  "main": "server.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
