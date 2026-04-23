@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
 // 🔹 Puerto dinámico para Railway
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Casa Hedy Bot corriendo en puerto ${PORT}`);
   console.log(`📋 Variables cargadas:`);
   console.log(`   VERIFY_TOKEN: ${process.env.VERIFY_TOKEN ? '✅' : '❌ FALTA'}`);
