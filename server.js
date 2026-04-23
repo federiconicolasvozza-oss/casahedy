@@ -1,40 +1,43 @@
-require('dotenv').config();
-const express = require('express');
-const { handleWebhookVerification, handleIncomingMessage } = require('./bot');
+const express = require("express");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(express.json());
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({
-    status: 'online',
-    service: 'WhatsApp Bot - Casa Hedy',
-    timestamp: new Date().toISOString()
-  });
-});
+// 🔐 Token que vos definís en Railway y en Meta (tienen que coincidir)
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "botconektar123";
 
-// Webhook verification (GET)
-app.get('/webhook', (req, res) => {
-  handleWebhookVerification(req, res);
-});
+// 🔹 Verificación del webhook (Meta)
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
 
-// Webhook messages (POST)
-app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // Responder rápido a Meta
-  try {
-    await handleIncomingMessage(req.body);
-  } catch (error) {
-    console.error('💥 Error procesando mensaje:', error);
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("Webhook verificado correctamente");
+    return res.status(200).send(challenge);
+  } else {
+    console.log("Error de verificación webhook");
+    return res.sendStatus(403);
   }
 });
 
+// 🔹 Recepción de eventos (mensajes, estados, etc.)
+app.post("/webhook", (req, res) => {
+  console.log("Evento recibido:");
+  console.dir(req.body, { depth: null });
+
+  // ⚠️ Siempre responder 200 rápido
+  res.sendStatus(200);
+});
+
+// 🔹 Endpoint raíz (para test rápido)
+app.get("/", (req, res) => {
+  res.send("Casa Hedy API OK");
+});
+
+// 🔹 Puerto dinámico para Railway
+const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-  console.log(`🔪 Casa Hedy Bot en puerto ${PORT}`);
-  console.log(`🤖 Gemini: ${process.env.GEMINI_API_KEY ? '✅' : '❌ Falta GEMINI_API_KEY'}`);
-  console.log(`📦 Tienda Nube: ${process.env.TIENDANUBE_ACCESS_TOKEN ? '✅' : '⚠️ Sin catálogo dinámico'}`);
-  console.log(`📨 Notif. WhatsApp: ${process.env.OWNER_PHONE ? '✅ → ' + process.env.OWNER_PHONE : '⚠️ Sin OWNER_PHONE'}`);
-  console.log(`📊 Google Sheets: ${process.env.GOOGLE_SHEET_WEBHOOK ? '✅' : '⚠️ No configurado'}`);
+  console.log(`Servidor corriendo en puerto ${PORT}`);
 });
