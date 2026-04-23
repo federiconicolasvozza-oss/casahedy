@@ -629,9 +629,12 @@ async function handleIncomingMessage(body) {
 
     await sendMessage(from, aiResponse);
 
-    if (leadData) {
+  if (leadData) {
       if (!leadData.nombre && contactName) leadData.nombre = contactName;
       await processLead(from, leadData);
+    } else {
+      // Guardar contacto aunque no tenga leadData
+      await processLead(from, { leadScore: 1, motivo: messageBody.slice(0, 100), nombre: contactName || null, derivar: false });
     }
 
     if (shouldHandoff(aiResponse, leadData)) {
