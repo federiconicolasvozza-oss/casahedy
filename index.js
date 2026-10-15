@@ -25,7 +25,7 @@ const {
   DAILY_NOTIF_TIME = "07:30", // hora Buenos Aires, lunes a sábado
   PORT = 8080,
 } = process.env;
-
+E
 const GRAPH = "https://graph.facebook.com/v21.0";
 
 // =====================================================================
@@ -624,9 +624,4 @@ app.post("/webhook", async (req, res) => {
 
   if (role === "CANDIDATO") return handleCandidato(from, text);
   return handleStaff(from, role, text);
-});
-
-app.get("/", (_, res) => res.send("Bot Transtech OK"));
-app.listen(PORT, () => {
-  console.log(`Escuchando en ${PORT} · ADMIN: ${ADMIN.size} · COORD: ${COORD.size}`);
 });
