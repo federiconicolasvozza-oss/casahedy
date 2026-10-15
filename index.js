@@ -58,15 +58,25 @@ function roleOf(from) {
   return "CANDIDATO";
 }
 
+// Nombres para saludar (opcional): STAFF_NAMES=5491164228135=Fede,5491128787529=Sergio
+const NOMBRES = new Map(
+  String(process.env.STAFF_NAMES || "")
+    .split(",")
+    .map((par) => par.split("="))
+    .filter(([t, n]) => t && n)
+    .map(([t, n]) => [normPhone(t), n.trim()])
+);
+const nombreDe = (from) => NOMBRES.get(normPhone(from)) || "";
+
 // =====================================================================
 // 2) PERMISOS — can(role, action) se valida antes de CUALQUIER acción
 // =====================================================================
 const PERMISOS = {
   ADMIN: new Set([
-    "ayuda", "estado_envio", "cambiar_precio", "crear_etiqueta", "notificar",
+    "ayuda", "charla", "estado_envio", "cambiar_precio", "crear_etiqueta", "notificar",
     "tarifas", "contable", "liquidacion",
   ]),
-  COORD: new Set(["ayuda", "estado_envio", "cambiar_precio", "crear_etiqueta", "notificar"]),
+  COORD: new Set(["ayuda", "charla", "estado_envio", "cambiar_precio", "crear_etiqueta", "notificar"]),
   CANDIDATO: new Set(["consulta_chofer"]),
 };
 const can = (role, action) => PERMISOS[role]?.has(action) === true;
@@ -185,15 +195,16 @@ function parseStaff(text) {
   return { action: "ayuda", unknown: true };
 }
 
-function menu(role) {
-  const l = ["Comandos disponibles:"];
-  if (can(role, "estado_envio")) l.push("/estado <id> — estado de un envío");
-  if (can(role, "cambiar_precio")) l.push("/precio <id> <monto> — cambiar precio de un envío");
-  if (can(role, "crear_etiqueta")) l.push("/etiqueta cliente | destinatario | dirección | localidad | teléfono");
-  if (can(role, "notificar")) l.push("/notificar — enviar ahora la notificación diaria");
-  if (can(role, "tarifas")) l.push("/tarifas — tarifas vigentes");
-  if (can(role, "contable")) l.push("/cobros · /pagos · /cuenta <cliente> · /boletas");
-  if (can(role, "liquidacion")) l.push("/liquidacion [semana] — liquidación de choferes");
+function menu(role, nombre = "") {
+  const l = [`Hola${nombre ? " " + nombre : ""} 👋 ¿En qué te doy una mano?`, "", "Pedime lo que necesites, por ejemplo:"];
+  if (can(role, "estado_envio")) l.push("📦 _¿Cómo viene el envío 4471823?_");
+  if (can(role, "cambiar_precio")) l.push("💲 _Poné el envío 4471823 a $3500_");
+  if (can(role, "crear_etiqueta")) l.push("🏷️ _Haceme una etiqueta para Juan Pérez, Mitre 1200, Avellaneda, tel 1155556666, cliente X_");
+  if (can(role, "notificar")) l.push("🔔 _Mandá el resumen del día_");
+  if (can(role, "tarifas")) l.push("📋 _Pasame las tarifas_");
+  if (can(role, "contable")) l.push("💰 _¿Qué cobros hay pendientes?_ / _¿Cómo está la cuenta de X?_");
+  if (can(role, "liquidacion")) l.push("🧾 _Liquidación de choferes de la semana pasada_");
+  l.push("", "Escribilo como te salga, yo lo entiendo.");
   return l.join("\n");
 }
 
@@ -204,11 +215,11 @@ const EJECUTAR = {
   estado_envio: async ({ id }) => {
     const e = await Z.getEnvio(id);
     return [
-      `Envío ${e.id ?? id}`,
-      `Estado: ${e.estado ?? "-"}`,
+      `📦 *Envío ${e.id ?? id}* — ${e.estado ?? "sin estado"}`,
+      "",
       `Cliente: ${e.cliente ?? "-"}`,
-      `Destino: ${e.direccion ?? "-"} (${e.localidad ?? "-"})`,
-      `Chofer: ${e.chofer ?? "-"}`,
+      `Destino: ${e.direccion ?? "-"}${e.localidad ? ", " + e.localidad : ""}`,
+      `Chofer: ${e.chofer ?? "sin asignar"}`,
       `Precio: ${e.precio != null ? money(e.precio) : "-"}`,
     ].join("\n");
   },
@@ -226,7 +237,7 @@ const EJECUTAR = {
   },
   tarifas: async () => fmt(await Z.tarifas()),
   contable: async ({ sub, q }) => {
-    if (sub === "libre") return menu("ADMIN");
+    if (sub === "libre") return "¿Qué necesitás ver? Cobros, pagos, la cuenta de algún cliente o boletas.";
     return fmt(await Z.contable(sub, q));
   },
   liquidacion: async ({ q }) => fmt(await Z.liquidacion(q)),
@@ -236,40 +247,100 @@ const EJECUTAR = {
 async function prepararConfirmacion(action, params) {
   if (action === "cambiar_precio") {
     const monto = Number(String(params.monto || "").replace(/[$.\s]/g, "").replace(",", "."));
-    if (!params.id || !Number.isFinite(monto) || monto <= 0)
-      return { error: "Formato: /precio <id_envio> <monto>\nEj: /precio 4471823 3500" };
+    if (!params.id) return { error: "¿De qué envío? Pasame el número." };
+    if (!Number.isFinite(monto) || monto <= 0) return { error: `¿A qué precio dejo el envío ${params.id}?` };
     const e = await Z.getEnvio(params.id);
     const actual = e.precio != null ? money(e.precio) : "sin precio";
     return {
       params: { id: params.id, monto },
-      preview: `¿Cambiar el precio del envío ${params.id} (${e.cliente ?? "-"}) de ${actual} a ${money(monto)}?`,
+      preview: `💲 Envío *${params.id}* (${e.cliente ?? "-"})\nPrecio actual: ${actual}\nPrecio nuevo: *${money(monto)}*`,
     };
   }
   if (action === "crear_etiqueta") {
-    const f = (params.raw || "").split("|").map((s) => s.trim());
-    if (f.length !== 5 || f.some((x) => !x))
-      return { error: "Formato: /etiqueta cliente | destinatario | dirección | localidad | teléfono" };
-    const [cliente, destinatario, direccion, localidad, telefono] = f;
+    let f = params;
+    if (params.raw != null) {
+      const p = params.raw.split("|").map((s) => s.trim());
+      f = { cliente: p[0], destinatario: p[1], direccion: p[2], localidad: p[3], telefono: p[4] };
+    }
+    const etiquetas = { cliente: "cliente", destinatario: "nombre del destinatario", direccion: "dirección", localidad: "localidad", telefono: "teléfono" };
+    const faltan = Object.keys(etiquetas).filter((k) => !String(f[k] || "").trim());
+    if (faltan.length) return { error: `Para la etiqueta me falta: ${faltan.map((k) => etiquetas[k]).join(", ")}.` };
+    const d = Object.fromEntries(Object.keys(etiquetas).map((k) => [k, String(f[k]).trim()]));
     return {
-      params: { cliente, destinatario, direccion, localidad, telefono },
-      preview: `¿Crear etiqueta?\nCliente: ${cliente}\nPara: ${destinatario}\n${direccion}, ${localidad}\nTel: ${telefono}`,
+      params: d,
+      preview: `🏷️ *Etiqueta nueva*\nCliente: ${d.cliente}\nPara: ${d.destinatario}\n${d.direccion}, ${d.localidad}\nTel: ${d.telefono}`,
     };
   }
   return { error: "Acción no soportada" };
 }
 
+// ---------------------------------------------------------------------
+// Intérprete de lenguaje natural para el staff.
+// Gemini SOLO traduce el mensaje a {action, params}. No ejecuta nada ni decide permisos:
+// el permiso lo valida can() con el rol que sale de msg.from.
+// ---------------------------------------------------------------------
+const ACCIONES_CONOCIDAS = new Set([
+  "ayuda", "charla", "estado_envio", "cambiar_precio", "crear_etiqueta",
+  "notificar", "tarifas", "contable", "liquidacion",
+]);
+
+const PROMPT_STAFF = `Sos el intérprete del asistente interno de Transtech (logística Mercado Libre Flex) por WhatsApp.
+Tu única tarea es entender qué pide el usuario y devolver JSON. No ejecutás nada, no inventás datos ni das información del sistema.
+Acciones:
+- estado_envio {id}: consultar cómo viene / dónde está un envío
+- cambiar_precio {id, monto (número sin $ ni puntos)}: cambiar el precio de un envío
+- crear_etiqueta {cliente, destinatario, direccion, localidad, telefono}: etiqueta manual
+- notificar {}: mandar ahora el resumen/notificación diaria
+- tarifas {}: ver tarifas vigentes
+- contable {sub: "cobros"|"pagos"|"cuenta"|"boletas", q: cliente o detalle}: cualquier cosa de cobros, pagos, deudas, saldos, cuentas corrientes, facturas o boletas
+- liquidacion {q: semana o detalle}: liquidación o pago a choferes
+- ayuda {}: saludo, o pregunta qué puede hacer
+- charla {}: agradecimiento, "ok", o charla sin pedido concreto
+Usá el historial para completar datos que el usuario dio en mensajes anteriores.
+Si falta un dato obligatorio para la acción, poné en "falta" una pregunta corta y natural pidiendo solo eso.
+En "reply" (solo para charla) una respuesta corta, cordial, tono argentino.
+Respondé SOLO: {"action":"","params":{},"falta":"","reply":""}`;
+
+const staffHist = new Map(); // phone -> últimos mensajes (contexto corto)
+
+async function interpretStaff(from, text) {
+  if (text.startsWith("/") || !GEMINI_API_KEY) return parseStaff(text);
+  const h = staffHist.get(from) || [];
+  h.push({ role: "user", parts: [{ text: text.slice(0, 1000) }] });
+  try {
+    const raw = await gemini(PROMPT_STAFF, h.slice(-8), 0.1);
+    h.push({ role: "model", parts: [{ text: raw }] });
+    staffHist.set(from, h.slice(-8));
+    const j = JSON.parse(raw);
+    const action = ACCIONES_CONOCIDAS.has(j.action) ? j.action : "ayuda";
+    return { action, params: j.params || {}, falta: j.falta || "", reply: j.reply || "" };
+  } catch (e) {
+    staffHist.set(from, h.slice(-8));
+    console.error("interpretStaff", scrub(e.message));
+    return parseStaff(text); // si Gemini falla, caemos a la detección por palabras clave
+  }
+}
+
+function mensajeError(e) {
+  if (/Zupply 404/.test(e.message)) return "No encontré ese envío en el sistema. ¿Está bien el número?";
+  if (/no configurada/.test(e.message)) return "Esa función todavía no está conectada al sistema.";
+  return "Uy, no pude completarlo, el sistema no respondió. Probá de nuevo en un rato.";
+}
+
 async function handleStaff(from, role, text) {
+  const nombre = nombreDe(from);
+
   // ¿Hay una confirmación pendiente?
   const p = pending.get(from);
   if (p) {
     pending.delete(from);
     if (Date.now() > p.exp) {
       audit(from, role, p.action, "confirmacion_vencida");
-      return sendText(from, "La confirmación venció. Repetí el comando.");
+      return sendText(from, "Pasó mucho tiempo y lo cancelé por las dudas. Pedímelo de nuevo.");
     }
-    if (!/^s[ií]$/i.test(text.trim())) {
+    if (!/^s[ií]\.?!?$/i.test(text.trim())) {
       audit(from, role, p.action, "cancelada");
-      return sendText(from, "Cancelado. No se hizo ningún cambio.");
+      return sendText(from, "Listo, lo cancelé. No cambié nada 👍");
     }
     if (!can(role, p.action)) { // revalidación por las dudas
       audit(from, role, p.action, "denegado");
@@ -278,15 +349,17 @@ async function handleStaff(from, role, text) {
     try {
       const out = await EJECUTAR[p.action](p.params);
       audit(from, role, p.action, "ok", JSON.stringify(p.params));
+      staffHist.delete(from);
       return sendText(from, out);
     } catch (e) {
       audit(from, role, p.action, "error", e.message);
-      return sendText(from, "❌ No se pudo completar la acción. Quedó registrado en el log.");
+      return sendText(from, "❌ " + mensajeError(e));
     }
   }
 
-  const intent = parseStaff(text);
+  const intent = await interpretStaff(from, text);
 
+  // El permiso se valida SIEMPRE antes de hacer cualquier cosa (también antes de pedir datos faltantes)
   if (!can(role, intent.action)) {
     audit(from, role, intent.action, "denegado", text);
     return sendText(from, DENEGADO);
@@ -294,31 +367,40 @@ async function handleStaff(from, role, text) {
 
   if (intent.action === "ayuda") {
     audit(from, role, "ayuda", "ok");
-    return sendText(from, (intent.unknown ? "No entendí el pedido.\n\n" : "") + menu(role));
+    return sendText(from, (intent.unknown ? "No te entendí bien 🤔\n\n" : "") + menu(role, nombre));
+  }
+  if (intent.action === "charla") {
+    audit(from, role, "charla", "ok");
+    return sendText(from, intent.reply || "👍");
+  }
+  if (intent.falta) {
+    audit(from, role, intent.action, "falta_dato");
+    return sendText(from, intent.falta);
   }
 
   try {
     if (ACCIONES_QUE_MODIFICAN.has(intent.action)) {
       const prep = await prepararConfirmacion(intent.action, intent.params);
       if (prep.error) {
-        audit(from, role, intent.action, "formato_invalido", text);
+        audit(from, role, intent.action, "falta_dato", text);
         return sendText(from, prep.error);
       }
       pending.set(from, { action: intent.action, params: prep.params, exp: Date.now() + 5 * 60 * 1000 });
       audit(from, role, intent.action, "pendiente_confirmacion", JSON.stringify(prep.params));
-      return sendText(from, `${prep.preview}\n\nRespondé *SI* para confirmar (vence en 5 min).`);
+      return sendText(from, `${prep.preview}\n\n¿Lo hago? Respondé *SI* para confirmar. Cualquier otra cosa lo cancela.`);
     }
 
     if (intent.action === "estado_envio" && !intent.params?.id) {
-      return sendText(from, "Formato: /estado <id_envio>");
+      return sendText(from, "¿Qué envío querés que busque? Pasame el número.");
     }
 
     const out = await EJECUTAR[intent.action](intent.params || {});
     audit(from, role, intent.action, "ok", JSON.stringify(intent.params || {}));
+    staffHist.delete(from);
     return sendText(from, out);
   } catch (e) {
     audit(from, role, intent.action, "error", e.message);
-    return sendText(from, "❌ No se pudo completar la consulta. Quedó registrado en el log.");
+    return sendText(from, "❌ " + mensajeError(e));
   }
 }
 
@@ -428,22 +510,26 @@ function getCand(phone) {
   return s;
 }
 
-async function askGemini(s, userText) {
-  s.history.push({ role: "user", parts: [{ text: userText.slice(0, 1000) }] });
+async function gemini(system, contents, temperature) {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: PROMPT_CANDIDATO }] },
-        contents: s.history.slice(-30),
-        generationConfig: { responseMimeType: "application/json", temperature: 0.6 },
+        systemInstruction: { parts: [{ text: system }] },
+        contents,
+        generationConfig: { responseMimeType: "application/json", temperature },
       }),
     }
   );
   if (!res.ok) throw new Error(`Gemini ${res.status}`);
-  const raw = (await res.json())?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+  return (await res.json())?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+}
+
+async function askGemini(s, userText) {
+  s.history.push({ role: "user", parts: [{ text: userText.slice(0, 1000) }] });
+  const raw = await gemini(PROMPT_CANDIDATO, s.history.slice(-30), 0.6);
   s.history.push({ role: "model", parts: [{ text: raw }] });
   try { return JSON.parse(raw); } catch { return { reply: raw, datos: {}, completo: false, score: 0 }; }
 }
@@ -532,7 +618,7 @@ app.post("/webhook", async (req, res) => {
     audit(from, role, "mensaje_no_texto", "ignorado", msg.type);
     return sendText(from, role === "CANDIDATO"
       ? "Por ahora leo solo texto 🙏 ¿Me lo escribís?"
-      : "Solo comandos de texto. Escribí /ayuda.");
+      : "Por ahora solo leo mensajes de texto 🙏");
   }
   const text = msg.text.body.trim();
 
