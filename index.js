@@ -25,7 +25,7 @@ const {
   DAILY_NOTIF_TIME = "07:30", // hora Buenos Aires, lunes a sábado
   PORT = 8080,
 } = process.env;
-E
+
 const GRAPH = "https://graph.facebook.com/v21.0";
 
 // =====================================================================
@@ -87,7 +87,7 @@ const DENEGADO = "No tenés permiso para esa sección";
 // =====================================================================
 // 3) LOG DE AUDITORÍA — número, rol, acción, resultado. Sin tokens.
 // =====================================================================
-const SECRETS = [WHATSAPP_TOKEN, ZUPPLY_API_KEY, GEMINI_API_KEY, APP_SECRET, VERIFY_TOKEN]
+const SECRETS = [WHATSAPP_TOKEN, ZUPPLY_API_KEY, GEMINI_API_KEY, APP_SECRET, VERIFY_TOKEN, process.env.GROK_WEBHOOK_KEY]
   .filter((s) => s && s.length > 6);
 function scrub(v) {
   let s = String(v ?? "");
@@ -304,6 +304,9 @@ Respondé SOLO: {"action":"","params":{},"falta":"","reply":""}`;
 const staffHist = new Map(); // phone -> últimos mensajes (contexto corto)
 
 async function interpretStaff(from, text) {
+  // Saludos y "menú" muestran siempre las opciones, sin pasar por Gemini
+  if (/^(hola|holis|buenas|buen d[ií]a|buenas tardes|buenas noches|menu|menú|ayuda|opciones)\W*$/i.test(text.trim()))
+    return { action: "ayuda", params: {} };
   if (text.startsWith("/") || !GEMINI_API_KEY) return parseStaff(text);
   const h = staffHist.get(from) || [];
   h.push({ role: "user", parts: [{ text: text.slice(0, 1000) }] });
@@ -623,5 +626,24 @@ app.post("/webhook", async (req, res) => {
   const text = msg.text.body.trim();
 
   if (role === "CANDIDATO") return handleCandidato(from, text);
-  return handleStaff(from, role, text);
+  // Reenvío de ADMIN/COORD al webhook externo. Si no está configurado o falla, contesta el bot como siempre.
+  if (!process.env.GROK_WEBHOOK_URL || !process.env.GROK_WEBHOOK_KEY) return handleStaff(from, role, text);
+  try {
+    const r = await fetch(process.env.GROK_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROK_WEBHOOK_KEY}` },
+      body: JSON.stringify({ from: normPhone(from), role, text, msg_id: msg.id }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) throw new Error(`webhook ${r.status}`); // fetch no tira error en 4xx/5xx
+    audit(from, role, "reenviado_grok", "ok");
+  } catch (e) {
+    audit(from, role, "reenviado_grok", "error", e.message);
+    return handleStaff(from, role, text);
+  }
+});
+
+app.get("/", (_, res) => res.send("Bot Transtech OK"));
+app.listen(PORT, () => {
+  console.log(`Escuchando en ${PORT} · ADMIN: ${ADMIN.size} · COORD: ${COORD.size}`);
 });
