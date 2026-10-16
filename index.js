@@ -1,5 +1,5 @@
 // Bot WhatsApp Transtech — control de acceso por número de remitente
-// Node 18+ (fetch nativo) · Express · WhatsApp Cloud API · Zupply API · Gemini (solo bot de choferes nuevos)
+// Node 18+ (fetch nativo) · Express · WhatsApp Cloud API · Zupply API · Gemini
 // Todas las credenciales y listas de números van en variables de entorno (ver .env.example).
 
 const express = require("express");
@@ -19,10 +19,12 @@ const {
   ZUPPLY_API_URL,
   ZUPPLY_API_KEY,
   SHEETS_WEBHOOK_URL,       // Apps Script: log de auditoría + postulantes
-  TEMPLATE_DAILY_NAME,      // plantilla aprobada por Meta para la notificación diaria
-  TEMPLATE_POSTULANTE_NAME, // plantilla aprobada para avisar a ADMIN de un postulante
+  TEMPLATE_DAILY_NAME,      // plantilla aprobada por Meta: resumen diario de incidencias comerciales
+  TEMPLATE_POSTULANTE_NAME, // plantilla aprobada por Meta: aviso de postulante a ADMIN
   TEMPLATE_LANG = "es_AR",
-  DAILY_NOTIF_TIME = "07:30", // hora Buenos Aires, lunes a sábado
+  DAILY_NOTIF_TIME = "09:30", // hora Buenos Aires, lunes a sábado
+  GROK_WEBHOOK_URL,         // opcional: reenvío de pedidos YA AUTORIZADOS a un sistema externo
+  GROK_WEBHOOK_KEY,
   PORT = 8080,
 } = process.env;
 
@@ -69,37 +71,45 @@ const NOMBRES = new Map(
 const nombreDe = (from) => NOMBRES.get(normPhone(from)) || "";
 
 // =====================================================================
-// 2) PERMISOS — can(role, action) se valida antes de CUALQUIER acción
+// 2) PERMISOS — primero se clasifica el intent, después can(role, intent)
 // =====================================================================
+const OPERATIVAS = [
+  "ayuda", "charla",
+  "estado_envio",      // un envío puntual: estado, tracking, chofer, precio
+  "consultar_envios",  // listados / conteos: en camino, entregados, pendientes, por cliente o chofer
+  "incidencias",       // comprador ausente, no visitado, reprogramado, dirección comercial 🏢
+  "resumen_diario",    // pedir el resumen de incidencias comerciales del día
+  "cambiar_precio",    // modifica → pide SI
+  "crear_etiqueta",    // modifica → pide SI
+  "asignar",           // modifica → pide SI
+];
 const PERMISOS = {
-  ADMIN: new Set([
-    "ayuda", "charla", "estado_envio", "cambiar_precio", "crear_etiqueta", "notificar",
-    "tarifas", "contable", "liquidacion",
-  ]),
-  COORD: new Set(["ayuda", "charla", "estado_envio", "cambiar_precio", "crear_etiqueta", "notificar"]),
+  ADMIN: new Set([...OPERATIVAS, "notificar", "tarifas", "contable", "liquidacion"]),
+  COORD: new Set(OPERATIVAS),
   CANDIDATO: new Set(["consulta_chofer"]),
 };
 const can = (role, action) => PERMISOS[role]?.has(action) === true;
 
-const ACCIONES_QUE_MODIFICAN = new Set(["cambiar_precio", "crear_etiqueta"]);
+const ACCIONES_QUE_MODIFICAN = new Set(["cambiar_precio", "crear_etiqueta", "asignar"]);
 const DENEGADO = "No tenés permiso para esa sección";
 
 // =====================================================================
-// 3) LOG DE AUDITORÍA — número, rol, acción, resultado. Sin tokens.
+// 3) LOG DE AUDITORÍA — número, rol, intent, permitido/denegado, resultado. Sin tokens.
 // =====================================================================
-const SECRETS = [WHATSAPP_TOKEN, ZUPPLY_API_KEY, GEMINI_API_KEY, APP_SECRET, VERIFY_TOKEN, process.env.GROK_WEBHOOK_KEY]
+const SECRETS = [WHATSAPP_TOKEN, ZUPPLY_API_KEY, GEMINI_API_KEY, APP_SECRET, VERIFY_TOKEN, GROK_WEBHOOK_KEY]
   .filter((s) => s && s.length > 6);
 function scrub(v) {
   let s = String(v ?? "");
   for (const k of SECRETS) s = s.split(k).join("***");
-  return s.replace(/Bearer\s+\S+/gi, "Bearer ***").slice(0, 500);
+  return s.replace(/Bearer\s+\S+/gi, "Bearer ***").replace(/key=[^&\s]+/gi, "key=***").slice(0, 500);
 }
-function audit(phone, role, action, result, detail = "") {
+function audit(phone, role, intent, permiso, result = "", detail = "") {
   const e = {
     ts: new Date().toISOString(),
     phone: normPhone(phone),
     role,
-    action,
+    intent,
+    permiso,          // permitido | denegado | - (eventos sin chequeo de permiso)
     result: scrub(result),
     detail: scrub(detail),
   };
@@ -115,6 +125,8 @@ function audit(phone, role, action, result, detail = "") {
 
 // =====================================================================
 // WHATSAPP
+// Las respuestas a un mensaje entrante van como texto (estamos dentro de la ventana de 24 h).
+// Todo lo proactivo (resumen diario, aviso de postulante) va SOLO con plantillas aprobadas.
 // =====================================================================
 async function waSend(payload) {
   const res = await fetch(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
@@ -154,74 +166,246 @@ async function zupply(method, path, body) {
   if (!res.ok) throw new Error(`Zupply ${res.status}`);
   return res.json();
 }
+const enc = encodeURIComponent;
+const qs = (o) => {
+  const p = Object.entries(o || {})
+    .filter(([, v]) => v !== undefined && v !== null && v !== "")
+    .map(([k, v]) => `${k}=${enc(v)}`)
+    .join("&");
+  return p ? "?" + p : "";
+};
 const Z = {
-  getEnvio: (id) => zupply("GET", `/api/envios/${encodeURIComponent(id)}`),
-  setPrecio: (id, precio) => zupply("PATCH", `/api/envios/${encodeURIComponent(id)}/precio`, { precio }),
+  getEnvio: (id) => zupply("GET", `/api/envios/${enc(id)}`),
+  listarEnvios: (f) => zupply("GET", `/api/envios${qs(f)}`),            // esperado: { total, items: [...] }
+  incidencias: (f) => zupply("GET", `/api/incidencias${qs(f)}`),        // esperado: { total, items: [...] }
+  resumenComerciales: () => zupply("GET", "/api/incidencias/resumen-diario?comercial=1"), // { params: [...], texto }
+  setPrecio: (id, precio) => zupply("PATCH", `/api/envios/${enc(id)}/precio`, { precio }),
   crearEtiqueta: (d) => zupply("POST", "/api/etiquetas", d),
-  resumenDiario: () => zupply("GET", "/api/resumen-diario"), // esperado: { params: [...] }
+  asignar: (d) => zupply("POST", "/api/asignaciones", d),
   tarifas: () => zupply("GET", "/api/tarifas"),
-  contable: (sub, q) => zupply("GET", `/api/contable/${sub}?q=${encodeURIComponent(q || "")}`),
-  liquidacion: (q) => zupply("GET", `/api/liquidacion?semana=${encodeURIComponent(q || "")}`),
+  contable: (sub, q) => zupply("GET", `/api/contable/${enc(sub)}${qs({ q })}`),
+  liquidacion: (q) => zupply("GET", `/api/liquidacion${qs({ semana: q })}`),
 };
 const fmt = (r) => r?.texto || JSON.stringify(r, null, 1).slice(0, 3500);
 const money = (n) => "$" + Number(n).toLocaleString("es-AR");
 
 // =====================================================================
-// STAFF (ADMIN / COORD) — comandos deterministas
+// CLASIFICACIÓN DEL INTENT
+// Gemini propone {action, params}; después se aplican reglas fijas por palabras clave.
+// El permiso NUNCA lo decide Gemini: lo decide can() con el rol de msg.from.
 // =====================================================================
+const MOTIVOS = {
+  comprador_ausente: "comprador ausente",
+  no_visitado: "no visitado",
+  reprogramado_comprador: "reprogramado por comprador",
+};
+const ESTADOS = { en_camino: "en camino", entregado: "entregados", pendiente: "pendientes" };
+
+const RX = {
+  // Restringido inequívoco → manda siempre, aunque se mencionen envíos
+  liq: /liquidaci|\badelantos?\b|totales? a pagar|(pag(o|os|ar|arle|arles)|cobr\w*) (a |al |de )?(los )?choferes?/i,
+  contFuerte: /cobr|\bboletas?\b|\bfacturas?\b|\bsaldos?\b|\bdeudas?\b|\bmacro\b|\befectivo\b|mercado ?pago|alquiler|contab|cuentas? corrientes?|\bcuentas\b/i,
+  // Señal débil de plata: solo cuenta si NO se habla de envíos/incidencias
+  contDebil: /\bpag(o|os|ar|aron|amos)\b|\bdeben?\b|\bcuenta\b/i,
+  // Operativo
+  oper: /env[ií]os?|pedidos?|paquetes?|tracking|seguimiento|en camino|entregad|pendientes?|ausentes?|no visitad|reprogram|comercial|🏢|incidencias?|etiquetas?|asign|rutas?|viajes?/i,
+  incid: /ausentes?|no visitad|reprogram|comercial|🏢|incidencias?/i,
+};
+const UN_ENVIO = new Set(["estado_envio", "cambiar_precio"]); // operan sobre un envío puntual
+
+function filtrosDeTexto(t) {
+  const f = {};
+  if (/ausente/i.test(t)) f.motivo = "comprador_ausente";
+  else if (/no visitad/i.test(t)) f.motivo = "no_visitado";
+  else if (/reprogram/i.test(t)) f.motivo = "reprogramado_comprador";
+  if (/comercial|🏢/i.test(t)) f.comercial = true;
+  if (/en camino/i.test(t)) f.estado = "en_camino";
+  else if (/entregad/i.test(t)) f.estado = "entregado";
+  else if (/pendiente/i.test(t)) f.estado = "pendiente";
+  if (/cu[aá]nt[oa]s|cantidad|total de/i.test(t)) f.solo_conteo = true;
+  return f;
+}
+
+function aplicarReglas(text, intent) {
+  const t = text;
+  const puntual = UN_ENVIO.has(intent.action) && intent.params?.id;
+
+  // 1) Liquidación / contable inequívoco → restringido
+  if (RX.liq.test(t)) return { action: "liquidacion", params: { q: intent.params?.q || "" } };
+  if (RX.contFuerte.test(t) && !puntual)
+    return { action: "contable", params: intent.action === "contable" ? intent.params : { sub: "libre" } };
+
+  // 2) Habla de envíos/incidencias pero quedó en contable/liquidación/ayuda → ante la duda, operativo
+  const mal = ["contable", "liquidacion", "tarifas"].includes(intent.action) || (intent.action === "ayuda" && intent.unknown);
+  if (RX.oper.test(t) && mal) {
+    return { action: RX.incid.test(t) ? "incidencias" : "consultar_envios", params: filtrosDeTexto(t) };
+  }
+
+  // 3) Plata sin contexto de envíos → contable
+  if (RX.contDebil.test(t) && !RX.oper.test(t) && !puntual)
+    return { action: "contable", params: intent.action === "contable" ? intent.params : { sub: "libre", q: t } };
+
+  // Completar filtros que Gemini no haya puesto
+  if (intent.action === "incidencias" || intent.action === "consultar_envios") {
+    const p = Object.fromEntries(Object.entries(intent.params || {}).filter(([, v]) => v !== "" && v !== null));
+    return { ...intent, params: { ...filtrosDeTexto(t), ...p } };
+  }
+  return intent;
+}
+
+// Fallback sin Gemini (o comandos con barra)
 function parseStaff(text) {
   const t = text.trim();
   const [cmdRaw, ...rest] = t.split(/\s+/);
   const cmd = cmdRaw.toLowerCase();
   const args = rest.join(" ");
-
   switch (cmd) {
-    case "/ayuda": case "ayuda": case "menu": case "menú": case "hola":
-      return { action: "ayuda" };
+    case "/ayuda": return { action: "ayuda" };
     case "/estado": return { action: "estado_envio", params: { id: rest[0] } };
     case "/precio": return { action: "cambiar_precio", params: { id: rest[0], monto: rest[1] } };
     case "/etiqueta": return { action: "crear_etiqueta", params: { raw: args } };
+    case "/asignar": return { action: "asignar", params: { ids: rest.slice(0, -1), chofer: rest.at(-1) } };
+    case "/incidencias": return { action: "incidencias", params: filtrosDeTexto(args) };
+    case "/resumen": return { action: "resumen_diario" };
     case "/notificar": return { action: "notificar" };
     case "/tarifas": return { action: "tarifas" };
     case "/cobros": case "/pagos": case "/cuenta": case "/boletas":
       return { action: "contable", params: { sub: cmd.slice(1), q: args } };
-    case "/liquidacion": case "/liquidación":
-      return { action: "liquidacion", params: { q: args } };
+    case "/liquidacion": case "/liquidación": return { action: "liquidacion", params: { q: args } };
   }
-  // Pedidos en texto libre a secciones restringidas → se clasifican igual, para poder negarlos
-  if (/liquidaci/i.test(t)) return { action: "liquidacion", params: {} };
-  if (/(cobr|pago|cuenta corriente|boleta|factura|contab|saldo|deuda)/i.test(t))
-    return { action: "contable", params: { sub: "libre" } };
+  const id = (t.match(/\b\d{6,}\b/) || [])[0];
+  if (RX.liq.test(t)) return { action: "liquidacion", params: {} };
+  if (RX.contFuerte.test(t)) return { action: "contable", params: { sub: "libre", q: t } };
+  if (RX.incid.test(t)) return { action: "incidencias", params: filtrosDeTexto(t) };
+  if (/asign/i.test(t)) {
+    const ids = t.match(/\b\d{6,}\b/g) || [];
+    const viaje = (t.match(/viaje\s+(\S+)/i) || [])[1] || "";
+    const chofer = (t.match(/\ba\s+([A-ZÁÉÍÓÚÑ][\wáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][\wáéíóúñ]+)?)\s*$/) || [])[1] || "";
+    return { action: "asignar", params: { ids, viaje, chofer } };
+  }
+  if (id && /precio/i.test(t)) return { action: "cambiar_precio", params: { id, monto: (t.match(/\$?\s?([\d.]+)\s*$/) || [])[1] } };
+  if (id) return { action: "estado_envio", params: { id } };
+  if (RX.oper.test(t)) return { action: "consultar_envios", params: filtrosDeTexto(t) };
+  if (RX.contDebil.test(t)) return { action: "contable", params: { sub: "libre", q: t } };
   return { action: "ayuda", unknown: true };
 }
 
+const ACCIONES_CONOCIDAS = new Set([...OPERATIVAS, "notificar", "tarifas", "contable", "liquidacion"]);
+
+const PROMPT_STAFF = `Sos el intérprete del asistente interno de Transtech (logística Mercado Libre Flex) por WhatsApp.
+Tu única tarea es entender qué pide el usuario y devolver JSON. No ejecutás nada, no inventás datos ni das información del sistema.
+Acciones:
+- estado_envio {id}: estado, tracking, chofer asignado o precio de UN envío puntual
+- consultar_envios {estado:"en_camino"|"entregado"|"pendiente"|"", cliente, chofer, fecha, solo_conteo:bool}: listados o conteos de envíos/pedidos/paquetes
+- incidencias {motivo:"comprador_ausente"|"no_visitado"|"reprogramado_comprador"|"", comercial:true|null, cliente, chofer, fecha, solo_conteo:bool}: pedidos con problemas de entrega. Dirección comercial (🏢) = comercial:true. "cuántos..." = solo_conteo:true
+- resumen_diario {}: pedir el resumen del día de incidencias comerciales
+- cambiar_precio {id, monto (número sin $ ni puntos)}: cambiar el precio de un envío
+- crear_etiqueta {cliente, destinatario, direccion, localidad, telefono}: etiqueta manual
+- asignar {ids:[ids de envíos], viaje, chofer}: asignar paquetes o un viaje a un chofer
+- notificar {}: mandar ahora el resumen diario a todo el equipo
+- tarifas {}: ver tarifas vigentes
+- contable {sub:"cobros"|"pagos"|"cuenta"|"boletas"|"saldos", q}: SOLO plata de la empresa: cobros a clientes, pagos, cuentas Macro/efectivo/MercadoPago, boletas, saldos, deudas de clientes, alquileres
+- liquidacion {q}: liquidación de choferes, períodos, adelantos, totales a pagar a choferes
+- ayuda {}: saludo, o pregunta qué puede hacer
+- charla {}: agradecimiento, "ok", o charla sin pedido concreto
+IMPORTANTE: cualquier pregunta sobre envíos, pedidos, paquetes o incidencias (ausente, no visitado, reprogramado, comercial) es consultar_envios o incidencias, NUNCA contable.
+Usá el historial para completar datos que el usuario dio en mensajes anteriores.
+Si falta un dato obligatorio para cambiar_precio, crear_etiqueta, asignar o estado_envio, poné en "falta" una pregunta corta pidiendo solo eso.
+En "reply" (solo para charla) una respuesta corta, cordial, tono argentino.
+Respondé SOLO: {"action":"","params":{},"falta":"","reply":""}`;
+
+const staffHist = new Map(); // phone -> últimos mensajes (contexto corto)
+
+async function interpretStaff(from, text) {
+  // Saludos y "menú" muestran siempre las opciones, sin pasar por Gemini
+  if (/^(hola|holis|buenas|buen d[ií]a|buenas tardes|buenas noches|menu|menú|ayuda|opciones)\W*$/i.test(text.trim()))
+    return { action: "ayuda", params: {} };
+  if (text.startsWith("/") || !GEMINI_API_KEY) return aplicarReglas(text, parseStaff(text));
+
+  const h = staffHist.get(from) || [];
+  h.push({ role: "user", parts: [{ text: text.slice(0, 1000) }] });
+  try {
+    const raw = await gemini(PROMPT_STAFF, h.slice(-8), 0.1);
+    h.push({ role: "model", parts: [{ text: raw }] });
+    staffHist.set(from, h.slice(-8));
+    const j = JSON.parse(raw);
+    const base = ACCIONES_CONOCIDAS.has(j.action)
+      ? { action: j.action, params: j.params || {}, falta: j.falta || "", reply: j.reply || "" }
+      : { action: "ayuda", params: {}, unknown: true };
+    const final = aplicarReglas(text, base);
+    // si la regla cambió la acción, la pregunta de "falta" de Gemini ya no aplica
+    if (final.action !== base.action) { final.falta = ""; final.reply = ""; }
+    return final;
+  } catch (e) {
+    staffHist.set(from, h.slice(-8));
+    console.error("interpretStaff", scrub(e.message));
+    return aplicarReglas(text, parseStaff(text)); // si Gemini falla, palabras clave
+  }
+}
+
+// =====================================================================
+// STAFF (ADMIN / COORD)
+// =====================================================================
 function menu(role, nombre = "") {
   const l = [`Hola${nombre ? " " + nombre : ""} 👋 ¿En qué te doy una mano?`, "", "Pedime lo que necesites, por ejemplo:"];
   if (can(role, "estado_envio")) l.push("📦 _¿Cómo viene el envío 4471823?_");
+  if (can(role, "consultar_envios")) l.push("🚚 _¿Cuántos pendientes tiene Marcelo hoy?_");
+  if (can(role, "incidencias")) l.push("⚠️ _¿Cuántos comerciales con comprador ausente hay?_");
   if (can(role, "cambiar_precio")) l.push("💲 _Poné el envío 4471823 a $3500_");
   if (can(role, "crear_etiqueta")) l.push("🏷️ _Haceme una etiqueta para Juan Pérez, Mitre 1200, Avellaneda, tel 1155556666, cliente X_");
-  if (can(role, "notificar")) l.push("🔔 _Mandá el resumen del día_");
+  if (can(role, "asignar")) l.push("👤 _Asigná el 4471823 y el 4471824 a Marcelo_");
+  if (can(role, "resumen_diario")) l.push("🗒️ _Pasame el resumen de hoy_");
   if (can(role, "tarifas")) l.push("📋 _Pasame las tarifas_");
-  if (can(role, "contable")) l.push("💰 _¿Qué cobros hay pendientes?_ / _¿Cómo está la cuenta de X?_");
+  if (can(role, "contable")) l.push("💰 _¿Cuánto nos debe Maratón?_ / _Saldo de Macro_");
   if (can(role, "liquidacion")) l.push("🧾 _Liquidación de choferes de la semana pasada_");
   l.push("", "Escribilo como te salga, yo lo entiendo.");
   return l.join("\n");
 }
 
-const pending = new Map(); // phone -> { action, params, preview, exp }
+function descFiltros(f) {
+  return [
+    f.motivo ? MOTIVOS[f.motivo] || f.motivo : "",
+    f.estado ? ESTADOS[f.estado] || f.estado : "",
+    f.comercial ? "🏢 comerciales" : "",
+    f.cliente ? `cliente ${f.cliente}` : "",
+    f.chofer ? `chofer ${f.chofer}` : "",
+    f.fecha || "",
+  ].filter(Boolean).join(" · ");
+}
+function fmtListado(r, f, titulo) {
+  const items = r?.items || [];
+  const total = r?.total ?? items.length;
+  const desc = descFiltros(f);
+  const head = `${titulo} *${total}* ${total === 1 ? "pedido" : "pedidos"}${desc ? " — " + desc : ""}`;
+  if (f.solo_conteo || !items.length) return head;
+  const lines = items.slice(0, 15).map((i) =>
+    `• ${i.id} — ${i.cliente ?? "-"}${i.comercial ? " 🏢" : ""}` +
+    `\n   ${i.direccion ?? ""}${i.chofer ? " · " + i.chofer : ""}${!f.motivo && i.motivo ? " · " + i.motivo : ""}${!f.estado && i.estado ? " · " + i.estado : ""}`
+  );
+  if (items.length > 15) lines.push(`…y ${items.length - 15} más`);
+  return [head, "", ...lines].join("\n");
+}
 
-// Ejecutores: solo se llaman después de can() (y de "SI" si modifican datos)
+// Solo se llaman después de can() (y de "SI" si modifican datos)
 const EJECUTAR = {
   estado_envio: async ({ id }) => {
     const e = await Z.getEnvio(id);
     return [
       `📦 *Envío ${e.id ?? id}* — ${e.estado ?? "sin estado"}`,
       "",
-      `Cliente: ${e.cliente ?? "-"}`,
+      `Cliente: ${e.cliente ?? "-"}${e.comercial ? " 🏢" : ""}`,
       `Destino: ${e.direccion ?? "-"}${e.localidad ? ", " + e.localidad : ""}`,
       `Chofer: ${e.chofer ?? "sin asignar"}`,
+      e.tracking ? `Tracking: ${e.tracking}` : null,
+      e.incidencia ? `Incidencia: ${e.incidencia}` : null,
       `Precio: ${e.precio != null ? money(e.precio) : "-"}`,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
+  },
+  consultar_envios: async (f) => fmtListado(await Z.listarEnvios(f), f, "🚚"),
+  incidencias: async (f) => fmtListado(await Z.incidencias(f), f, "⚠️"),
+  resumen_diario: async () => {
+    const r = await Z.resumenComerciales();
+    return r?.texto || "🗒️ Resumen de incidencias comerciales:\n" + fmt(r);
   },
   cambiar_precio: async ({ id, monto }) => {
     await Z.setPrecio(id, monto);
@@ -231,20 +415,24 @@ const EJECUTAR = {
     const r = await Z.crearEtiqueta(d);
     return `✅ Etiqueta creada${r?.id ? ` (ID ${r.id})` : ""}${r?.url ? `\n${r.url}` : ""}`;
   },
+  asignar: async (d) => {
+    await Z.asignar(d);
+    return `✅ Asignado a ${d.chofer}: ${d.viaje ? "viaje " + d.viaje : d.ids.join(", ")}.`;
+  },
   notificar: async () => {
     const r = await sendDailyNotifications("manual");
-    return `Notificación diaria enviada a ${r.ok}/${r.total} destinatarios.`;
+    return `Resumen enviado a ${r.ok}/${r.total} del equipo.`;
   },
   tarifas: async () => fmt(await Z.tarifas()),
   contable: async ({ sub, q }) => {
-    if (sub === "libre") return "¿Qué necesitás ver? Cobros, pagos, la cuenta de algún cliente o boletas.";
-    return fmt(await Z.contable(sub, q));
+    // "libre": se manda la pregunta tal cual a Zupply para que la resuelva
+    return fmt(await Z.contable(sub || "libre", q));
   },
   liquidacion: async ({ q }) => fmt(await Z.liquidacion(q)),
 };
 
 // Validación de parámetros y armado del pedido de confirmación
-async function prepararConfirmacion(action, params) {
+async function prepararConfirmacion(action, params = {}) {
   if (action === "cambiar_precio") {
     const monto = Number(String(params.monto || "").replace(/[$.\s]/g, "").replace(",", "."));
     if (!params.id) return { error: "¿De qué envío? Pasame el número." };
@@ -262,166 +450,136 @@ async function prepararConfirmacion(action, params) {
       const p = params.raw.split("|").map((s) => s.trim());
       f = { cliente: p[0], destinatario: p[1], direccion: p[2], localidad: p[3], telefono: p[4] };
     }
-    const etiquetas = { cliente: "cliente", destinatario: "nombre del destinatario", direccion: "dirección", localidad: "localidad", telefono: "teléfono" };
-    const faltan = Object.keys(etiquetas).filter((k) => !String(f[k] || "").trim());
-    if (faltan.length) return { error: `Para la etiqueta me falta: ${faltan.map((k) => etiquetas[k]).join(", ")}.` };
-    const d = Object.fromEntries(Object.keys(etiquetas).map((k) => [k, String(f[k]).trim()]));
+    const campos = { cliente: "cliente", destinatario: "nombre del destinatario", direccion: "dirección", localidad: "localidad", telefono: "teléfono" };
+    const faltan = Object.keys(campos).filter((k) => !String(f[k] || "").trim());
+    if (faltan.length) return { error: `Para la etiqueta me falta: ${faltan.map((k) => campos[k]).join(", ")}.` };
+    const d = Object.fromEntries(Object.keys(campos).map((k) => [k, String(f[k]).trim()]));
     return {
       params: d,
       preview: `🏷️ *Etiqueta nueva*\nCliente: ${d.cliente}\nPara: ${d.destinatario}\n${d.direccion}, ${d.localidad}\nTel: ${d.telefono}`,
     };
   }
+  if (action === "asignar") {
+    const ids = (Array.isArray(params.ids) ? params.ids : String(params.ids || "").split(/[\s,y]+/))
+      .map((x) => String(x).trim()).filter(Boolean);
+    const viaje = String(params.viaje || "").trim();
+    const chofer = String(params.chofer || "").trim();
+    if (!ids.length && !viaje) return { error: "¿Qué paquetes o qué viaje asigno? Pasame los números." };
+    if (!chofer) return { error: "¿A qué chofer se lo asigno?" };
+    return {
+      params: { ids, viaje, chofer },
+      preview: `👤 *Asignación*\n${viaje ? "Viaje: " + viaje : `Paquetes (${ids.length}): ${ids.join(", ")}`}\nChofer: *${chofer}*`,
+    };
+  }
   return { error: "Acción no soportada" };
 }
 
-// ---------------------------------------------------------------------
-// Intérprete de lenguaje natural para el staff.
-// Gemini SOLO traduce el mensaje a {action, params}. No ejecuta nada ni decide permisos:
-// el permiso lo valida can() con el rol que sale de msg.from.
-// ---------------------------------------------------------------------
-const ACCIONES_CONOCIDAS = new Set([
-  "ayuda", "charla", "estado_envio", "cambiar_precio", "crear_etiqueta",
-  "notificar", "tarifas", "contable", "liquidacion",
-]);
-
-const PROMPT_STAFF = `Sos el intérprete del asistente interno de Transtech (logística Mercado Libre Flex) por WhatsApp.
-Tu única tarea es entender qué pide el usuario y devolver JSON. No ejecutás nada, no inventás datos ni das información del sistema.
-Acciones:
-- estado_envio {id}: consultar cómo viene / dónde está un envío
-- cambiar_precio {id, monto (número sin $ ni puntos)}: cambiar el precio de un envío
-- crear_etiqueta {cliente, destinatario, direccion, localidad, telefono}: etiqueta manual
-- notificar {}: mandar ahora el resumen/notificación diaria
-- tarifas {}: ver tarifas vigentes
-- contable {sub: "cobros"|"pagos"|"cuenta"|"boletas", q: cliente o detalle}: cualquier cosa de cobros, pagos, deudas, saldos, cuentas corrientes, facturas o boletas
-- liquidacion {q: semana o detalle}: liquidación o pago a choferes
-- ayuda {}: saludo, o pregunta qué puede hacer
-- charla {}: agradecimiento, "ok", o charla sin pedido concreto
-Usá el historial para completar datos que el usuario dio en mensajes anteriores.
-Si falta un dato obligatorio para la acción, poné en "falta" una pregunta corta y natural pidiendo solo eso.
-En "reply" (solo para charla) una respuesta corta, cordial, tono argentino.
-Respondé SOLO: {"action":"","params":{},"falta":"","reply":""}`;
-
-const staffHist = new Map(); // phone -> últimos mensajes (contexto corto)
-
-async function interpretStaff(from, text) {
-  // Saludos y "menú" muestran siempre las opciones, sin pasar por Gemini
-  if (/^(hola|holis|buenas|buen d[ií]a|buenas tardes|buenas noches|menu|menú|ayuda|opciones)\W*$/i.test(text.trim()))
-    return { action: "ayuda", params: {} };
-  if (text.startsWith("/") || !GEMINI_API_KEY) return parseStaff(text);
-  const h = staffHist.get(from) || [];
-  h.push({ role: "user", parts: [{ text: text.slice(0, 1000) }] });
-  try {
-    const raw = await gemini(PROMPT_STAFF, h.slice(-8), 0.1);
-    h.push({ role: "model", parts: [{ text: raw }] });
-    staffHist.set(from, h.slice(-8));
-    const j = JSON.parse(raw);
-    const action = ACCIONES_CONOCIDAS.has(j.action) ? j.action : "ayuda";
-    return { action, params: j.params || {}, falta: j.falta || "", reply: j.reply || "" };
-  } catch (e) {
-    staffHist.set(from, h.slice(-8));
-    console.error("interpretStaff", scrub(e.message));
-    return parseStaff(text); // si Gemini falla, caemos a la detección por palabras clave
-  }
-}
-
 function mensajeError(e) {
-  if (/Zupply 404/.test(e.message)) return "No encontré ese envío en el sistema. ¿Está bien el número?";
+  if (/Zupply 404/.test(e.message)) return "No encontré eso en el sistema. ¿Está bien el número o el nombre?";
   if (/no configurada/.test(e.message)) return "Esa función todavía no está conectada al sistema.";
   return "Uy, no pude completarlo, el sistema no respondió. Probá de nuevo en un rato.";
 }
 
-async function handleStaff(from, role, text) {
-  const nombre = nombreDe(from);
+// Reenvío opcional a sistema externo: SOLO pedidos ya autorizados (y confirmados si modifican datos)
+async function reenviar(from, role, action, params, text, msgId) {
+  if (!GROK_WEBHOOK_URL || !GROK_WEBHOOK_KEY) return false;
+  try {
+    const r = await fetch(GROK_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROK_WEBHOOK_KEY}` },
+      body: JSON.stringify({ from: normPhone(from), role, intent: action, params, text, msg_id: msgId, permitido: true }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) throw new Error(`webhook ${r.status}`);
+    audit(from, role, action, "permitido", "reenviado_ok");
+    return true;
+  } catch (e) {
+    audit(from, role, action, "permitido", "reenviado_error", e.message);
+    return false; // contesta el bot
+  }
+}
 
+async function ejecutar(from, role, action, params, text, msgId) {
+  if (!can(role, action)) { // última barrera antes de tocar datos
+    audit(from, role, action, "denegado", "bloqueado_en_ejecucion");
+    return sendText(from, DENEGADO);
+  }
+  if (await reenviar(from, role, action, params, text, msgId)) return;
+  try {
+    const out = await EJECUTAR[action](params || {});
+    audit(from, role, action, "permitido", "ok", JSON.stringify(params || {}));
+    staffHist.delete(from);
+    return sendText(from, out);
+  } catch (e) {
+    audit(from, role, action, "permitido", "error", e.message);
+    return sendText(from, "❌ " + mensajeError(e));
+  }
+}
+
+const pending = new Map(); // phone -> { action, params, text, exp }
+
+async function handleStaff(from, role, text, msgId) {
   // ¿Hay una confirmación pendiente?
   const p = pending.get(from);
   if (p) {
     pending.delete(from);
     if (Date.now() > p.exp) {
-      audit(from, role, p.action, "confirmacion_vencida");
+      audit(from, role, p.action, "-", "confirmacion_vencida");
       return sendText(from, "Pasó mucho tiempo y lo cancelé por las dudas. Pedímelo de nuevo.");
     }
-    if (!/^s[ií]\.?!?$/i.test(text.trim())) {
-      audit(from, role, p.action, "cancelada");
+    if (!/^s[ií]\W*$/i.test(text.trim())) {
+      audit(from, role, p.action, "-", "cancelada");
       return sendText(from, "Listo, lo cancelé. No cambié nada 👍");
     }
-    if (!can(role, p.action)) { // revalidación por las dudas
-      audit(from, role, p.action, "denegado");
-      return sendText(from, DENEGADO);
-    }
+    audit(from, role, p.action, "-", "confirmada");
+    return ejecutar(from, role, p.action, p.params, p.text, msgId);
+  }
+
+  // 1) Clasificar   2) Validar permiso   3) Recién ahí hacer algo
+  const intent = await interpretStaff(from, text);
+  const permitido = can(role, intent.action);
+  audit(from, role, intent.action, permitido ? "permitido" : "denegado", "", text);
+  if (!permitido) return sendText(from, DENEGADO);
+
+  if (intent.action === "ayuda")
+    return sendText(from, (intent.unknown ? "No te entendí bien 🤔\n\n" : "") + menu(role, nombreDe(from)));
+  if (intent.action === "charla") return sendText(from, intent.reply || "👍");
+  if (intent.falta) return sendText(from, intent.falta);
+
+  if (ACCIONES_QUE_MODIFICAN.has(intent.action)) {
     try {
-      const out = await EJECUTAR[p.action](p.params);
-      audit(from, role, p.action, "ok", JSON.stringify(p.params));
-      staffHist.delete(from);
-      return sendText(from, out);
+      const prep = await prepararConfirmacion(intent.action, intent.params);
+      if (prep.error) return sendText(from, prep.error);
+      pending.set(from, { action: intent.action, params: prep.params, text, exp: Date.now() + 5 * 60 * 1000 });
+      audit(from, role, intent.action, "permitido", "pendiente_confirmacion", JSON.stringify(prep.params));
+      return sendText(from, `${prep.preview}\n\n¿Lo hago? Respondé *SI* para confirmar. Cualquier otra cosa lo cancela.`);
     } catch (e) {
-      audit(from, role, p.action, "error", e.message);
+      audit(from, role, intent.action, "permitido", "error", e.message);
       return sendText(from, "❌ " + mensajeError(e));
     }
   }
 
-  const intent = await interpretStaff(from, text);
+  if (intent.action === "estado_envio" && !intent.params?.id)
+    return sendText(from, "¿Qué envío querés que busque? Pasame el número.");
 
-  // El permiso se valida SIEMPRE antes de hacer cualquier cosa (también antes de pedir datos faltantes)
-  if (!can(role, intent.action)) {
-    audit(from, role, intent.action, "denegado", text);
-    return sendText(from, DENEGADO);
-  }
-
-  if (intent.action === "ayuda") {
-    audit(from, role, "ayuda", "ok");
-    return sendText(from, (intent.unknown ? "No te entendí bien 🤔\n\n" : "") + menu(role, nombre));
-  }
-  if (intent.action === "charla") {
-    audit(from, role, "charla", "ok");
-    return sendText(from, intent.reply || "👍");
-  }
-  if (intent.falta) {
-    audit(from, role, intent.action, "falta_dato");
-    return sendText(from, intent.falta);
-  }
-
-  try {
-    if (ACCIONES_QUE_MODIFICAN.has(intent.action)) {
-      const prep = await prepararConfirmacion(intent.action, intent.params);
-      if (prep.error) {
-        audit(from, role, intent.action, "falta_dato", text);
-        return sendText(from, prep.error);
-      }
-      pending.set(from, { action: intent.action, params: prep.params, exp: Date.now() + 5 * 60 * 1000 });
-      audit(from, role, intent.action, "pendiente_confirmacion", JSON.stringify(prep.params));
-      return sendText(from, `${prep.preview}\n\n¿Lo hago? Respondé *SI* para confirmar. Cualquier otra cosa lo cancela.`);
-    }
-
-    if (intent.action === "estado_envio" && !intent.params?.id) {
-      return sendText(from, "¿Qué envío querés que busque? Pasame el número.");
-    }
-
-    const out = await EJECUTAR[intent.action](intent.params || {});
-    audit(from, role, intent.action, "ok", JSON.stringify(intent.params || {}));
-    staffHist.delete(from);
-    return sendText(from, out);
-  } catch (e) {
-    audit(from, role, intent.action, "error", e.message);
-    return sendText(from, "❌ " + mensajeError(e));
-  }
+  return ejecutar(from, role, intent.action, intent.params, text, msgId);
 }
 
 // =====================================================================
-// NOTIFICACIÓN DIARIA — solo ADMIN + COORD, con plantilla aprobada
+// RESUMEN DIARIO 9:30 — incidencias comerciales, solo ADMIN + COORD, con plantilla aprobada
 // =====================================================================
 async function sendDailyNotifications(trigger) {
   if (!TEMPLATE_DAILY_NAME) throw new Error("TEMPLATE_DAILY_NAME no configurada");
-  const resumen = await Z.resumenDiario();
+  const resumen = await Z.resumenComerciales();
   const destinos = [...ADMIN, ...COORD];
   let ok = 0;
   for (const to of destinos) {
     try {
       await sendTemplate(to, TEMPLATE_DAILY_NAME, resumen.params || []);
       ok++;
-      audit(to, roleOf(to), "notif_diaria", "ok", trigger);
+      audit(to, roleOf(to), "notif_diaria", "-", "ok", trigger);
     } catch (e) {
-      audit(to, roleOf(to), "notif_diaria", "error", e.message);
+      audit(to, roleOf(to), "notif_diaria", "-", "error", e.message);
     }
   }
   return { ok, total: destinos.length };
@@ -437,7 +595,7 @@ setInterval(async () => {
   try {
     await sendDailyNotifications("auto");
   } catch (e) {
-    audit("sistema", "SISTEMA", "notif_diaria", "error", e.message);
+    audit("sistema", "SISTEMA", "notif_diaria", "-", "error", e.message);
   }
 }, 30 * 1000);
 
@@ -537,22 +695,20 @@ async function askGemini(s, userText) {
   try { return JSON.parse(raw); } catch { return { reply: raw, datos: {}, completo: false, score: 0 }; }
 }
 
+// Aviso proactivo a ADMIN → solo con plantilla aprobada (fuera de 24 h el texto libre no llega)
 async function notificarPostulante(phone, s, score) {
   const d = s.datos;
   const params = [d.nombre, "+" + phone, d.zona, `${d.vehiculo || "-"} ${d.anio || ""}`, d.experiencia_flex, d.disponibilidad, `${score}/10`];
-  const texto =
-    `🚚 Nuevo postulante (score ${score}/10)\n` +
-    `Nombre: ${d.nombre || "-"}\nTel: +${phone}\nZona: ${d.zona || "-"}\n` +
-    `Vehículo: ${d.vehiculo || "-"} (${d.anio || "-"})\nFlex: ${d.experiencia_flex || "-"}\n` +
-    `Disponibilidad: ${d.disponibilidad || "-"}`;
-
   for (const to of ADMIN) {
+    if (!TEMPLATE_POSTULANTE_NAME) {
+      audit(to, "ADMIN", "aviso_postulante", "-", "sin_plantilla", phone);
+      continue;
+    }
     try {
-      if (TEMPLATE_POSTULANTE_NAME) await sendTemplate(to, TEMPLATE_POSTULANTE_NAME, params);
-      else await waSend({ to, type: "text", text: { body: texto } }); // solo llega dentro de la ventana de 24 h
-      audit(to, "ADMIN", "aviso_postulante", "ok", phone);
+      await sendTemplate(to, TEMPLATE_POSTULANTE_NAME, params);
+      audit(to, "ADMIN", "aviso_postulante", "-", "ok", phone);
     } catch (e) {
-      audit(to, "ADMIN", "aviso_postulante", "error", e.message);
+      audit(to, "ADMIN", "aviso_postulante", "-", "error", e.message);
     }
   }
   if (SHEETS_WEBHOOK_URL) {
@@ -565,23 +721,24 @@ async function notificarPostulante(phone, s, score) {
 }
 
 async function handleCandidato(from, text) {
-  if (!can("CANDIDATO", "consulta_chofer")) return;
+  const permitido = can("CANDIDATO", "consulta_chofer");
+  if (!permitido) return;
   const s = getCand(from);
   if (s.count > MAX_MSGS_DIA) {
-    audit(from, "CANDIDATO", "consulta_chofer", "limite_diario");
+    audit(from, "CANDIDATO", "consulta_chofer", "permitido", "limite_diario");
     return;
   }
   try {
     const out = await askGemini(s, text);
     s.datos = { ...s.datos, ...(out.datos || {}) };
     await sendText(from, out.reply || "¿Me repetís eso?");
-    audit(from, "CANDIDATO", "consulta_chofer", "ok");
+    audit(from, "CANDIDATO", "consulta_chofer", "permitido", "ok");
     if (out.completo && !s.notificado) {
       s.notificado = true;
       await notificarPostulante(normPhone(from), s, Number(out.score) || 0);
     }
   } catch (e) {
-    audit(from, "CANDIDATO", "consulta_chofer", "error", e.message);
+    audit(from, "CANDIDATO", "consulta_chofer", "permitido", "error", e.message);
     await sendText(from, "Tuve un problema técnico, ¿me escribís de nuevo en un rato?");
   }
 }
@@ -618,7 +775,7 @@ app.post("/webhook", async (req, res) => {
   const role = roleOf(from);
 
   if (msg.type !== "text") {
-    audit(from, role, "mensaje_no_texto", "ignorado", msg.type);
+    audit(from, role, "mensaje_no_texto", "-", "ignorado", msg.type);
     return sendText(from, role === "CANDIDATO"
       ? "Por ahora leo solo texto 🙏 ¿Me lo escribís?"
       : "Por ahora solo leo mensajes de texto 🙏");
@@ -626,21 +783,7 @@ app.post("/webhook", async (req, res) => {
   const text = msg.text.body.trim();
 
   if (role === "CANDIDATO") return handleCandidato(from, text);
-  // Reenvío de ADMIN/COORD al webhook externo. Si no está configurado o falla, contesta el bot como siempre.
-  if (!process.env.GROK_WEBHOOK_URL || !process.env.GROK_WEBHOOK_KEY) return handleStaff(from, role, text);
-  try {
-    const r = await fetch(process.env.GROK_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROK_WEBHOOK_KEY}` },
-      body: JSON.stringify({ from: normPhone(from), role, text, msg_id: msg.id }),
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!r.ok) throw new Error(`webhook ${r.status}`); // fetch no tira error en 4xx/5xx
-    audit(from, role, "reenviado_grok", "ok");
-  } catch (e) {
-    audit(from, role, "reenviado_grok", "error", e.message);
-    return handleStaff(from, role, text);
-  }
+  return handleStaff(from, role, text, msg.id);
 });
 
 app.get("/", (_, res) => res.send("Bot Transtech OK"));
