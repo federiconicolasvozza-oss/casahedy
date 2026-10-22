@@ -59,10 +59,23 @@ const ADMIN = parseList(process.env.ADMIN_PHONES);
 const COORD = parseList(process.env.COORD_PHONES);
 for (const p of ADMIN) COORD.delete(p); // si un número está en ambas listas, vale ADMIN
 
+// Clientes: CLIENTE_PHONES=5491164169313=Belladona,5491156262637=Maraton Urbano
+// (el nombre tiene que ser el mismo con el que figura el cliente en Zupply)
+const CLIENTES = new Map(
+  String(process.env.CLIENTE_PHONES || "")
+    .split(",")
+    .map((par) => par.split("="))
+    .filter(([t, n]) => t && n && n.trim() && !/completar/i.test(n))
+    .map(([t, n]) => [normPhone(t), n.trim()])
+);
+for (const p of [...ADMIN, ...COORD]) CLIENTES.delete(p); // el personal nunca queda como cliente
+const clienteDe = (from) => CLIENTES.get(normPhone(from)) || "";
+
 function roleOf(from) {
   const p = normPhone(from);
   if (ADMIN.has(p)) return "ADMIN";
   if (COORD.has(p)) return "COORD";
+  if (CLIENTES.has(p)) return "CLIENTE";
   return "CANDIDATO";
 }
 
@@ -94,6 +107,11 @@ const PERMISOS = {
   // "adjunto" = imagen/PDF sin texto que diga qué es → solo ADMIN (puede ser un comprobante, contable)
   ADMIN: new Set([...OPERATIVAS, "notificar", "tarifas", "contable", "liquidacion", "adjunto"]),
   COORD: new Set(OPERATIVAS),
+  // CLIENTE: solo SUS envíos (el filtro por cliente lo fuerza el código, no el mensaje)
+  CLIENTE: new Set([
+    "ayuda", "charla", "estado_envio", "consultar_envios", "incidencias",
+    "crear_etiqueta", "cuenta_cliente", "leer_foto",
+  ]),
   CANDIDATO: new Set(["consulta_chofer"]),
 };
 const can = (role, action) => PERMISOS[role]?.has(action) === true;
@@ -193,6 +211,7 @@ const Z = {
   tarifas: () => zupply("GET", "/api/tarifas"),
   contable: (sub, q) => zupply("GET", `/api/contable/${enc(sub)}${qs({ q })}`),
   liquidacion: (q) => zupply("GET", `/api/liquidacion${qs({ semana: q })}`),
+  cuentaCliente: (cliente) => zupply("GET", `/api/clientes/${enc(cliente)}/cuenta`), // solo la cuenta de ESE cliente
 };
 const fmt = (r) => r?.texto || JSON.stringify(r, null, 1).slice(0, 3500);
 const money = (n) => "$" + Number(n).toLocaleString("es-AR");
@@ -355,6 +374,18 @@ async function interpretStaff(from, text) {
 // STAFF (ADMIN / COORD)
 // =====================================================================
 function menu(role, nombre = "") {
+  if (role === "CLIENTE") {
+    return [
+      `Hola${nombre ? " " + nombre : ""} 👋 Soy el asistente de Transtech.`, "",
+      "Podés pedirme, por ejemplo:",
+      "📦 _¿Cómo viene el envío 4471823?_ (o mandame la foto de la etiqueta)",
+      "🚚 _¿Cuántos envíos tengo en camino hoy?_",
+      "⚠️ _¿Qué pedidos quedaron con comprador ausente?_",
+      "🏷️ _Armame una etiqueta para Juan Pérez, Mitre 1200, Avellaneda, tel 1155556666_",
+      "💰 _¿Cómo está mi cuenta?_",
+      "", "Escribilo como te salga, yo lo entiendo.",
+    ].join("\n");
+  }
   const l = [`Hola${nombre ? " " + nombre : ""} 👋 ¿En qué te doy una mano?`, "", "Pedime lo que necesites, por ejemplo:"];
   if (can(role, "estado_envio")) l.push("📦 _¿Cómo viene el envío 4471823?_");
   if (can(role, "consultar_envios")) l.push("🚚 _¿Cuántos pendientes tiene Marcelo hoy?_");
@@ -396,8 +427,10 @@ function fmtListado(r, f, titulo) {
 
 // Solo se llaman después de can() (y de "SI" si modifican datos)
 const EJECUTAR = {
-  estado_envio: async ({ id }) => {
+  estado_envio: async ({ id, _cliente }) => {
     const e = await Z.getEnvio(id);
+    // Un cliente solo puede ver envíos propios. Si no es suyo, se responde igual que si no existiera.
+    if (_cliente && !mismoCliente(e.cliente, _cliente)) throw new Error("NO_ES_SUYO");
     return [
       `📦 *Envío ${e.id ?? id}* — ${e.estado ?? "sin estado"}`,
       "",
@@ -409,8 +442,8 @@ const EJECUTAR = {
       `Precio: ${e.precio != null ? money(e.precio) : "-"}`,
     ].filter(Boolean).join("\n");
   },
-  consultar_envios: async (f) => fmtListado(await Z.listarEnvios(f), f, "🚚"),
-  incidencias: async (f) => fmtListado(await Z.incidencias(f), f, "⚠️"),
+  consultar_envios: async (f) => fmtListado(soloDelCliente(await Z.listarEnvios(sinInternos(f)), f._cliente), sinInternos(f), "🚚"),
+  incidencias: async (f) => fmtListado(soloDelCliente(await Z.incidencias(sinInternos(f)), f._cliente), sinInternos(f), "⚠️"),
   resumen_diario: async () => {
     const r = await Z.resumenComerciales();
     return r?.texto || "🗒️ Resumen de incidencias comerciales:\n" + fmt(r);
@@ -420,7 +453,7 @@ const EJECUTAR = {
     return `✅ Precio del envío ${id} actualizado a ${money(monto)}.`;
   },
   crear_etiqueta: async (d) => {
-    const r = await Z.crearEtiqueta(d);
+    const r = await Z.crearEtiqueta(sinInternos(d));
     return `✅ Etiqueta creada${r?.id ? ` (ID ${r.id})` : ""}${r?.url ? `\n${r.url}` : ""}`;
   },
   asignar: async (d) => {
@@ -437,6 +470,17 @@ const EJECUTAR = {
     return fmt(await Z.contable(sub || "libre", q));
   },
   liquidacion: async ({ q }) => fmt(await Z.liquidacion(q)),
+  cuenta_cliente: async ({ _cliente }) => {
+    if (!_cliente) throw new Error("NO_ES_SUYO");
+    const r = await Z.cuentaCliente(_cliente);
+    if (r?.texto) return r.texto;
+    return [
+      `💰 *Tu cuenta — ${_cliente}*`, "",
+      r?.saldo != null ? `Saldo: ${money(r.saldo)}` : null,
+      r?.ultimo_pago ? `Último pago: ${r.ultimo_pago}` : null,
+      r?.pendiente != null ? `Pendiente de pago: ${money(r.pendiente)}` : null,
+    ].filter(Boolean).join("\n") || fmt(r);
+  },
 };
 
 // Validación de parámetros y armado del pedido de confirmación
@@ -482,7 +526,31 @@ async function prepararConfirmacion(action, params = {}) {
   return { error: "Acción no soportada" };
 }
 
+// ---------------------------------------------------------------------
+// CLIENTE: el filtro por cliente se fuerza con el número (msg.from), nunca con el texto
+// ---------------------------------------------------------------------
+const normNombre = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+const mismoCliente = (a, b) => !!normNombre(a) && normNombre(a) === normNombre(b);
+
+function forzarCliente(role, from, action, params = {}) {
+  if (role !== "CLIENTE") return params;
+  const cliente = clienteDe(from);
+  const p = { ...params, _cliente: cliente };
+  if (["consultar_envios", "incidencias", "crear_etiqueta"].includes(action)) p.cliente = cliente; // pisa lo que haya pedido
+  if (action === "consultar_envios" || action === "incidencias") delete p.chofer; // no ve datos internos de choferes
+  return p;
+}
+// Doble control: si Zupply devolviera envíos de otro cliente (filtro no aplicado), no se muestra nada
+function soloDelCliente(r, cliente) {
+  if (!cliente) return r;
+  const items = Array.isArray(r?.items) ? r.items : [];
+  if (items.some((i) => i.cliente != null && !mismoCliente(i.cliente, cliente))) throw new Error("FILTRO_CLIENTE");
+  return r;
+}
+const sinInternos = (p) => Object.fromEntries(Object.entries(p || {}).filter(([k]) => !k.startsWith("_")));
+
 function mensajeError(e) {
+  if (e.message === "NO_ES_SUYO") return "No encontré ese envío entre los tuyos. ¿Está bien el número?";
   if (/Zupply 404/.test(e.message)) return "No encontré eso en el sistema. ¿Está bien el número o el nombre?";
   if (/no configurada/.test(e.message)) return "Esa función todavía no está conectada al sistema.";
   return "Uy, no pude completarlo, el sistema no respondió. Probá de nuevo en un rato.";
@@ -515,7 +583,9 @@ async function ejecutar(from, role, action, params, text, msgId, media = null) {
     audit(from, role, action, "denegado", "bloqueado_en_ejecucion");
     return sendText(from, DENEGADO);
   }
-  if (await reenviar(from, role, action, params, text, msgId, media)) return;
+  params = forzarCliente(role, from, action, params); // se vuelve a forzar justo antes de ejecutar
+  // Los pedidos de clientes se resuelven siempre acá (no se reenvían a sistemas externos)
+  if (role !== "CLIENTE" && await reenviar(from, role, action, sinInternos(params), text, msgId, media)) return;
   if (media && ["adjunto", "contable", "liquidacion"].includes(action)) {
     // Sin sistema externo, el bot no procesa comprobantes ni archivos sueltos.
     // (Las acciones operativas con etiqueta ya leída siguen y se ejecutan acá abajo.)
@@ -724,6 +794,7 @@ async function continuar(from, role, action, params, text, msgId, media) {
     audit(from, role, action, "denegado", "", text);
     return sendText(from, DENEGADO);
   }
+  params = forzarCliente(role, from, action, params);
   const faltan = faltantes(action, params);
   if (faltan.length) {
     completar.set(from, { action, params, faltan, text, media, exp: Date.now() + TTL_CONTEXTO });
@@ -746,12 +817,14 @@ async function continuar(from, role, action, params, text, msgId, media) {
 }
 
 async function procesarIntent(from, role, intent, text, msgId, media) {
+  // Para un cliente, cualquier pregunta de plata es sobre SU cuenta corriente (nunca la contabilidad interna)
+  if (role === "CLIENTE" && intent.action === "contable") intent = { action: "cuenta_cliente", params: {} };
   const permitido = can(role, intent.action);
   audit(from, role, intent.action, permitido ? "permitido" : "denegado", "", text);
   if (!permitido) return sendText(from, DENEGADO);
 
   if (intent.action === "ayuda")
-    return sendText(from, (intent.unknown ? "No te entendí bien 🤔\n\n" : "") + menu(role, nombreDe(from)));
+    return sendText(from, (intent.unknown ? "No te entendí bien 🤔\n\n" : "") + menu(role, nombreDe(from) || clienteDe(from)));
   if (intent.action === "charla") return sendText(from, intent.reply || "👍");
 
   let params = normalizarParams(intent.action, intent.params || {});
