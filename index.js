@@ -304,6 +304,8 @@ function parseStaff(text) {
   if (RX.liq.test(t)) return { action: "liquidacion", params: {} };
   if (RX.contFuerte.test(t)) return { action: "contable", params: { sub: "libre", q: t } };
   if (RX.incid.test(t)) return { action: "incidencias", params: filtrosDeTexto(t) };
+  if (/etiqueta|\bretir(o|ar)\b/i.test(t) && !RX.incid.test(t))
+    return { action: "crear_etiqueta", params: { tipo: tipoDeTexto(t) } };
   if (/asign/i.test(t)) {
     const ids = t.match(/\b\d{6,}\b/g) || [];
     const viaje = (t.match(/viaje\s+(\S+)/i) || [])[1] || "";
@@ -327,7 +329,7 @@ Acciones:
 - incidencias {motivo:"comprador_ausente"|"no_visitado"|"reprogramado_comprador"|"", comercial:true|null, cliente, chofer, fecha, solo_conteo:bool}: pedidos con problemas de entrega. Dirección comercial (🏢) = comercial:true. "cuántos..." = solo_conteo:true
 - resumen_diario {}: pedir el resumen del día de incidencias comerciales
 - cambiar_precio {id, monto (número sin $ ni puntos)}: cambiar el precio de un envío
-- crear_etiqueta {cliente, destinatario, direccion, localidad, telefono}: etiqueta manual
+- crear_etiqueta {cliente, destinatario, direccion, localidad, telefono, tipo:"envio"|"retiro"|"cambio"}: etiqueta manual. tipo "retiro" si habla de retiro/retirar, "cambio" si es un cambio de producto; si no, "envio". "Cargar/pedir/hacer un retiro" o "un cambio para X" también es crear_etiqueta
 - asignar {ids:[ids de envíos], viaje, chofer}: asignar paquetes o un viaje a un chofer
 - notificar {}: mandar ahora el resumen diario a todo el equipo
 - tarifas {}: ver tarifas vigentes
@@ -452,9 +454,23 @@ const EJECUTAR = {
     await Z.setPrecio(id, monto);
     return `✅ Precio del envío ${id} actualizado a ${money(monto)}.`;
   },
-  crear_etiqueta: async (d) => {
+  crear_etiqueta: async (d, from) => {
     const r = await Z.crearEtiqueta(sinInternos(d));
-    return `✅ Etiqueta creada${r?.id ? ` (ID ${r.id})` : ""}${r?.url ? `\n${r.url}` : ""}`;
+    // Para ver en qué campo devuelve Zupply el link del PDF. La firma de S3 se tapa (sirve 24 h para bajar la etiqueta).
+    console.log("[ETIQUETA_RESP]", scrub(JSON.stringify(r).replace(/(X-Amz-(Signature|Credential|Security-Token)=)[^&"]+/gi, "$1***")));
+    const id = r?.tracking || r?.id || r?._id || "";
+    const pdf = r?.url || r?.label_url || r?.labelUrl || r?.pdf || r?.etiqueta_url || r?.label;
+    const tipo = TIPOS_ETIQUETA[d.tipo] || TIPOS_ETIQUETA.envio;
+    // El link de S3 vence a las 24 h: se manda el PDF como archivo apenas se crea
+    if (pdf && from) {
+      try {
+        await waSend({ to: from, type: "document", document: { link: pdf, filename: `etiqueta-${tipo.toLowerCase()}-${id || "transtech"}.pdf` } });
+        return `✅ Etiqueta de ${tipo} creada${id ? ` (${id})` : ""}. Te mandé el PDF 👆`;
+      } catch (e) {
+        console.error("pdf", scrub(e.message));
+      }
+    }
+    return `✅ Etiqueta de ${tipo} creada${id ? ` (${id})` : ""}. El PDF te lo pasamos en un rato.`;
   },
   asignar: async (d) => {
     await Z.asignar(d);
@@ -506,9 +522,11 @@ async function prepararConfirmacion(action, params = {}) {
     const faltan = Object.keys(campos).filter((k) => !String(f[k] || "").trim());
     if (faltan.length) return { error: `Para la etiqueta me falta: ${faltan.map((k) => campos[k]).join(", ")}.` };
     const d = Object.fromEntries(Object.keys(campos).map((k) => [k, String(f[k]).trim()]));
+    d.tipo = TIPOS_ETIQUETA[f.tipo] ? f.tipo : "envio";
     return {
       params: d,
-      preview: `🏷️ *Etiqueta nueva*\nCliente: ${d.cliente}\nPara: ${d.destinatario}\n${d.direccion}, ${d.localidad}\nTel: ${d.telefono}`,
+      preview: `🏷️ *Etiqueta de ${TIPOS_ETIQUETA[d.tipo].toUpperCase()}*\nCliente: ${d.cliente}\nPara: ${d.destinatario}\n${d.direccion}, ${d.localidad}\nTel: ${d.telefono}` +
+        (d.tipo === "envio" ? "\n_(si es retiro o cambio, decímelo y la rehago)_" : ""),
     };
   }
   if (action === "asignar") {
@@ -593,7 +611,7 @@ async function ejecutar(from, role, action, params, text, msgId, media = null) {
     return sendText(from, "Recibí el archivo, pero todavía no puedo leer adjuntos desde acá. Si es urgente, pasámelo escrito.");
   }
   try {
-    const out = await EJECUTAR[action](params || {});
+    const out = await EJECUTAR[action](params || {}, from);
     audit(from, role, action, "permitido", "ok", JSON.stringify(params || {}));
     staffHist.delete(from);
     return sendText(from, out);
@@ -668,6 +686,15 @@ const CAMPOS = {
   direccion: "dirección", localidad: "localidad", telefono: "teléfono",
 };
 const ETIQUETA = ["cliente", "destinatario", "direccion", "localidad", "telefono"];
+const TIPOS_ETIQUETA = { envio: "Envío", retiro: "Retiro", cambio: "Cambio" };
+// El tipo se detecta por palabras clave del texto (manda sobre lo que diga Gemini)
+function tipoDeTexto(t) {
+  const s = String(t || "").toLowerCase();
+  if (/\bretir(o|os|ar|alo|ala)\b/.test(s)) return "retiro";
+  if (/\bcambios?\b(?! (el|de|del) precio)/.test(s) && !/precio/.test(s)) return "cambio";
+  if (/\benv[ií]o\b/.test(s) && /etiqueta/.test(s)) return "envio";
+  return "";
+}
 
 const vacio = (v) => (Array.isArray(v) ? !v.filter(Boolean).length : !String(v ?? "").trim());
 
@@ -701,6 +728,10 @@ function normalizarParams(action, p = {}) {
   if (o.ids !== undefined)
     o.ids = Array.isArray(o.ids) ? o.ids.map((x) => String(x).replace(/\D/g, "")).filter(Boolean) : normalizarCampo("ids", o.ids);
   if (o.telefono !== undefined) o.telefono = normalizarCampo("telefono", o.telefono);
+  if (action === "crear_etiqueta") {
+    const t = String(o.tipo || "").toLowerCase().replace("í", "i");
+    o.tipo = TIPOS_ETIQUETA[t] ? t : "";
+  }
   return o;
 }
 
@@ -828,6 +859,7 @@ async function procesarIntent(from, role, intent, text, msgId, media) {
   if (intent.action === "charla") return sendText(from, intent.reply || "👍");
 
   let params = normalizarParams(intent.action, intent.params || {});
+  if (intent.action === "crear_etiqueta" && tipoDeTexto(text)) params.tipo = tipoDeTexto(text);
 
   // Foto + pedido concreto en el texto: completar con lo que se lea de la foto.
   // Se hace DESPUÉS de validar el permiso: nunca se descarga nada para un pedido denegado.
@@ -855,6 +887,12 @@ async function handleStaff(from, role, text, msgId, media = null) {
     if (Date.now() > p.exp) {
       audit(from, role, p.action, "-", "confirmacion_vencida");
       return sendText(from, "Pasó mucho tiempo y lo cancelé por las dudas. Pedímelo de nuevo.");
+    }
+    // En la vista previa de una etiqueta, "es retiro" / "cambio" / "envío" cambia el tipo y la vuelve a mostrar
+    const nuevoTipo = !media && p.action === "crear_etiqueta" && !/^s[ií]\W*$/i.test(text.trim())
+      ? (tipoDeTexto(text) || (/^\W*(es\s+)?(un\s+)?env[ií]o\W*$/i.test(text) ? "envio" : "")) : "";
+    if (nuevoTipo && Date.now() <= p.exp) {
+      return continuar(from, role, p.action, { ...p.params, tipo: nuevoTipo }, p.text, msgId, p.media);
     }
     if (media || !/^s[ií]\W*$/i.test(text.trim())) {
       audit(from, role, p.action, "-", "cancelada");
@@ -906,7 +944,8 @@ async function handleStaff(from, role, text, msgId, media = null) {
         }
       }
       // La foto manda en los datos del envío; del texto solo se toman monto, chofer o viaje
-      const delTexto = Object.fromEntries(["monto", "chofer", "viaje"].filter((k) => !vacio(extra[k])).map((k) => [k, extra[k]]));
+      const delTexto = Object.fromEntries(["monto", "chofer", "viaje", "tipo"].filter((k) => !vacio(extra[k])).map((k) => [k, extra[k]]));
+      if (action === "crear_etiqueta" && tipoDeTexto(text)) delTexto.tipo = tipoDeTexto(text);
       const params = mezclar(datosFoto(action, f.datos), delTexto);
       return continuar(from, role, action, params, text, msgId, f.media);
     }
