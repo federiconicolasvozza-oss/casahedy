@@ -18,7 +18,6 @@ const {
   GEMINI_MODEL = "gemini-2.5-flash",
   ZUPPLY_API_URL,
   ZUPPLY_API_KEY,
-  SHEETS_WEBHOOK_URL,       // Apps Script: log de auditoría + postulantes
   TEMPLATE_DAILY_NAME,      // plantilla aprobada por Meta: resumen diario de incidencias comerciales
   TEMPLATE_POSTULANTE_NAME, // plantilla aprobada por Meta: aviso de postulante a ADMIN
   TEMPLATE_LANG = "es_AR",
@@ -29,6 +28,13 @@ const {
 } = process.env;
 
 const GRAPH = "https://graph.facebook.com/v21.0";
+
+// Apps Script (log de auditoría + postulantes). Si no está SHEETS_WEBHOOK_URL, se reutiliza
+// la URL de Apps Script que ya esté cargada en otra variable (la del bot de Casa Hedy).
+const SHEETS_WEBHOOK_URL =
+  process.env.SHEETS_WEBHOOK_URL ||
+  Object.values(process.env).find((v) => /^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(String(v).trim())) ||
+  "";
 
 // =====================================================================
 // 1) ROLES — se deciden SOLO con msg.from contra las listas del .env
@@ -1087,5 +1093,5 @@ app.post("/webhook", async (req, res) => {
 
 app.get("/", (_, res) => res.send("Bot Transtech OK"));
 app.listen(PORT, () => {
-  console.log(`Escuchando en ${PORT} · ADMIN: ${ADMIN.size} · COORD: ${COORD.size}`);
+  console.log(`Escuchando en ${PORT} · ADMIN: ${ADMIN.size} · COORD: ${COORD.size} · Planilla: ${SHEETS_WEBHOOK_URL ? "conectada" : "NO configurada"}`);
 });
