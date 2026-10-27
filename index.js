@@ -1198,13 +1198,25 @@ async function notificarPostulante(phone, s, score) {
       audit(to, "ADMIN", "aviso_postulante", "-", "error", e.message);
     }
   }
-  if (SHEETS_WEBHOOK_URL) {
-    fetch(SHEETS_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tipo: "postulante", fecha: new Date().toISOString(), telefono: phone, ...d, score }),
-    }).catch(() => {});
-  }
+}
+
+// Lista de llamados: una fila por postulante, que se actualiza con CADA mensaje (aunque no termine)
+function guardarPostulante(phone, s, { score = "", estado, ultimo = "" }) {
+  if (!SHEETS_WEBHOOK_URL) return;
+  const d = s.datos || {};
+  fetch(SHEETS_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      tipo: "postulante",
+      fecha: new Date().toISOString(),
+      telefono: phone,
+      whatsapp: `https://wa.me/${phone}`,
+      nombre: d.nombre || "", zona: d.zona || "", vehiculo: d.vehiculo || "", anio: d.anio || "",
+      experiencia_flex: d.experiencia_flex || "", disponibilidad: d.disponibilidad || "",
+      score, estado, mensajes: s.total || 0, ultimo_mensaje: String(ultimo).slice(0, 300),
+    }),
+  }).catch(() => {});
 }
 
 async function handleCandidato(from, text) {
@@ -1217,9 +1229,14 @@ async function handleCandidato(from, text) {
   }
   try {
     const out = await askGemini(s, text);
-    s.datos = { ...s.datos, ...(out.datos || {}) };
+    // No se borra un dato ya obtenido si Gemini lo devuelve vacío
+    for (const [k, v] of Object.entries(out.datos || {})) if (String(v ?? "").trim()) s.datos[k] = v;
+    s.total = (s.total || 0) + 1;
     await sendText(from, out.reply || "¿Me repetís eso?");
     audit(from, "CANDIDATO", "consulta_chofer", "permitido", "ok");
+    const score = Number(out.score) || "";
+    if (out.completo) s.completo = true;
+    guardarPostulante(normPhone(from), s, { score, estado: s.completo ? "Completa" : "Incompleta", ultimo: text });
     if (out.completo && !s.notificado) {
       s.notificado = true;
       await notificarPostulante(normPhone(from), s, Number(out.score) || 0);
