@@ -523,9 +523,14 @@ async function prepararConfirmacion(action, params = {}) {
     if (faltan.length) return { error: `Para la etiqueta me falta: ${faltan.map((k) => campos[k]).join(", ")}.` };
     const d = Object.fromEntries(Object.keys(campos).map((k) => [k, String(f[k]).trim()]));
     d.tipo = TIPOS_ETIQUETA[f.tipo] ? f.tipo : "envio";
+    // Si la dirección salió de la agenda, se avisa en la vista previa (y queda solo interno, no va a Zupply)
+    const fav = (AGENDA[normNombre(f.cliente)] || []).find((a) => a.alias === f._agenda);
+    const deAgenda = fav && normNombre(f.direccion) === normNombre(fav.direccion);
+    if (deAgenda) d._agenda = f._agenda;
     return {
       params: d,
       preview: `🏷️ *Etiqueta de ${TIPOS_ETIQUETA[d.tipo].toUpperCase()}*\nCliente: ${d.cliente}\nPara: ${d.destinatario}\n${d.direccion}, ${d.localidad}\nTel: ${d.telefono}` +
+        (d._agenda ? `\n📒 Dirección de tu agenda: *${d._agenda}*` : "") +
         (d.tipo === "envio" ? "\n_(si es retiro o cambio, decímelo y la rehago)_" : ""),
     };
   }
@@ -566,6 +571,40 @@ function soloDelCliente(r, cliente) {
   return r;
 }
 const sinInternos = (p) => Object.fromEntries(Object.entries(p || {}).filter(([k]) => !k.startsWith("_")));
+
+// ---------------------------------------------------------------------
+// Agenda de favoritos por cliente (clave = nombre del cliente, igual que en CLIENTE_PHONES / Zupply)
+// ---------------------------------------------------------------------
+const AGENDA = {
+  "casa hedy": [
+    { alias: "Retiro Martin Fierro", direccion: "Boulevard Ballester 7034", localidad: "San Martin" },
+    { alias: "MARTIN FIERRO FABRICA", direccion: "Calle 94 No 4643/47 Ruta 8 Km 16", localidad: "San Martin" },
+    { alias: "YARARA", direccion: "Av. Montes de Oca 6535", localidad: "Munro" },
+    { alias: "YARARA TARDE", direccion: "Roberto Wernicke 1747", localidad: "Munro" },
+    { alias: "3 CLAVELES ARGENTINA S.A.", direccion: "Lacarra 234", localidad: "CABA" },
+    { alias: "ANGEL M. BEBER S.A.", direccion: "Ruta 8 Km 17", localidad: "San Martin" },
+    { alias: "BARALDO", direccion: "Presidente Santiago Derqui 5180", localidad: "Munro" },
+    { alias: "DAYTON / ROZEMBAUM E HIJOS", direccion: "Curapaligüe 6510", localidad: "Munro" },
+    { alias: "DONIZETTI", direccion: "Donizetti 598", localidad: "CABA" },
+    { alias: "BOWIE", direccion: "Moreno 1460", localidad: "CABA" },
+    { alias: "JOSE HERNANDEZ", direccion: "Jose Hernandez 1349", localidad: "Ezpeleta" },
+    { alias: "SEGUDIES / BREMEN", direccion: "Independencia 166", localidad: "Bernal" },
+    { alias: "FAENA S.R.L.", direccion: "Bartolome Mitre 6130", localidad: "Wilde" },
+  ],
+};
+const eleccion = new Map(); // esperando que elija de la agenda: phone -> { opciones, params, text, media, exp }
+
+// Palabras del alias que no alcanzan solas para identificar un favorito
+const STOP_AGENDA = new Set(["retiro", "fabrica", "tarde", "argentina", "s.a.", "s.r.l.", "hijos"]);
+const palabras = (s) => normNombre(s).split(/[^a-z0-9.]+/).map((w) => w.replace(/^\.+|\.+$/g, "")).filter(Boolean);
+
+function buscarAgenda(cliente, text) {
+  const lista = AGENDA[normNombre(cliente)] || [];
+  const delTexto = new Set(palabras(text)); // palabras completas: "jose" no coincide con "josefina"
+  return lista.filter((a) =>
+    palabras(a.alias).some((w) => w.length >= 4 && !STOP_AGENDA.has(w) && delTexto.has(w)));
+}
+const desdeAgenda = (a) => ({ destinatario: a.alias, direccion: a.direccion, localidad: a.localidad, _agenda: a.alias });
 
 function mensajeError(e) {
   if (e.message === "NO_ES_SUYO") return "No encontré ese envío entre los tuyos. ¿Está bien el número?";
@@ -875,6 +914,24 @@ async function procesarIntent(from, role, intent, text, msgId, media) {
   }
 
   // Para las acciones con datos requeridos, los faltantes los pide continuar() (de a uno o en grupo)
+  // Agenda de favoritos: un CLIENTE se identifica por su número; el staff, por el "cliente X" que escriba
+  if (intent.action === "crear_etiqueta") {
+    const cli = role === "CLIENTE" ? clienteDe(from) : params.cliente;
+    const hits = buscarAgenda(cli, text);
+    if (hits.length === 1) {
+      params = mezclar(params, desdeAgenda(hits[0]));
+      audit(from, role, "agenda", "permitido", "1_coincidencia", hits[0].alias);
+    } else if (hits.length > 1) {
+      const opciones = hits.slice(0, 9);
+      eleccion.set(from, { opciones, params, text, media, exp: Date.now() + TTL_CONTEXTO });
+      audit(from, role, "agenda", "permitido", "varias_coincidencias", opciones.map((a) => a.alias).join(" | "));
+      return sendText(from, "📒 Encontré varias en tu agenda, ¿cuál es?\n\n" +
+        opciones.map((a, i) => `${i + 1}. *${a.alias}* — ${a.direccion}, ${a.localidad}`).join("\n") +
+        "\n0. Ninguna, uso los datos que escribí" +
+        "\n\nRespondé con el número.");
+    }
+  }
+
   if (intent.falta && !REQUERIDOS[intent.action]) return sendText(from, intent.falta);
   return continuar(from, role, intent.action, params, text, msgId, media);
 }
@@ -896,8 +953,10 @@ async function handleStaff(from, role, text, msgId, media = null) {
     }
     if (media || !/^s[ií]\W*$/i.test(text.trim())) {
       audit(from, role, p.action, "-", "cancelada");
-      if (!media) return sendText(from, "Listo, lo cancelé. No cambié nada 👍");
-      // llegó una foto nueva: se cancela lo anterior y se sigue con la foto
+      if (!media && (text.trim().length <= 3 || /^(no|cancel\w*|dej[aá]|nada|olvidate)\b/i.test(text.trim())))
+        return sendText(from, "Listo, lo cancelé. No cambié nada 👍");
+      // Llegó otro pedido (o una foto): se cancela lo anterior y se sigue con lo nuevo
+      await sendText(from, "Cancelé lo anterior, no cambié nada.");
     } else {
       audit(from, role, p.action, "-", "confirmada");
       return ejecutar(from, role, p.action, p.params, p.text, msgId, p.media);
@@ -905,7 +964,21 @@ async function handleStaff(from, role, text, msgId, media = null) {
   }
 
   // Una foto nueva reemplaza cualquier conversación a medias
-  if (media) { fotoCtx.delete(from); completar.delete(from); }
+  if (media) { fotoCtx.delete(from); completar.delete(from); eleccion.delete(from); }
+
+  // A2) Estábamos esperando que elija una dirección de la agenda
+  const el = eleccion.get(from);
+  if (el) {
+    eleccion.delete(from);
+    const n = Number((text.trim().match(/^(\d)\W*$/) || [])[1]);
+    if (Date.now() <= el.exp && n >= 0 && n <= el.opciones.length && /^\d\W*$/.test(text.trim())) {
+      const params = n === 0 ? el.params : mezclar(el.params, desdeAgenda(el.opciones[n - 1]));
+      audit(from, role, "agenda", "permitido", n === 0 ? "ninguna" : "elegida", n === 0 ? "" : el.opciones[n - 1].alias);
+      return continuar(from, role, "crear_etiqueta", params, el.text, msgId, el.media);
+    }
+    if (/^\d+\W*$/.test(text.trim())) return sendText(from, "Ese número no está en la lista. Pedime la etiqueta de nuevo.");
+    // si escribió otra cosa, sigue como un mensaje normal
+  }
 
   // B) Estábamos pidiendo datos que faltaban
   const c = completar.get(from);
